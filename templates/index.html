@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>文件管理器</title>
+    {% load static %}
+
+    <link rel="icon" href="{{ prefix }}{% static 'favicon.ico' %}">
+    <!-- 引入 Element UI 的 CSS 和 JS -->
+    <link rel="stylesheet" href="{{ prefix }}{% static 'css/element-ui.css' %}">
+    <link rel="stylesheet" href="{{ prefix }}{% static 'css/font-awesome.min.css' %}">
+    <link rel="stylesheet" href="{{ prefix }}{% static 'css/xterm.css' %}">
+</head>
+<body>
+<div id="app">
+    <el-row :gutter="5">
+        <el-col :span="8">
+            <el-card class="tree-box">
+                <el-tree
+                  ref="tree"
+                  class="file-tree"
+                  :props="props"
+                  :load="loadNode"
+                  lazy
+                  @node-click="handleNodeClick">
+                    <div class="custom-tree-node" slot-scope="{ node, data }">
+                        <div class="name">
+                            <i class="fa fa-plus-square-o" v-if="data.isParent"></i>
+                            <i class="fa fa-hide" v-else></i>
+
+                            <i class="fa" :class="{
+                                            'fa-folder-o': data.isParent,
+                                            'fa-file-text-o': !data.isParent }"></i>
+                            <span>${ data.name }</span>
+                        </div>
+                        <div class="info">
+                            <div class="size"> ${ data.size } </div>
+                            <div class="time"> ${ data.time } </div>
+                        </div>
+                    </div>
+                </el-tree>
+            </el-card>
+        </el-col>
+        <el-col :span="16">
+            <el-card class="options-box">
+                <el-input v-model="curr.path" disabled></el-input>
+                <div class="btns">
+                    <div class="left">
+                        连接状态:
+                        <i v-if="systemInfo.connected" style="background-color: #07a11b;"></i>
+                        <i v-else style="background-color: #fb4b4b;"></i>
+                    </div>
+                    <div class="right">
+                        <el-button type="danger" @click="handleClear">清空</el-button>
+                        <el-button type="primary" @click="handleRefresh">刷新</el-button>
+                        <el-popconfirm
+                          @confirm='handleDelete'
+                          title='确定删除吗?'
+                        >
+                            <el-button type="danger" slot='reference' style="margin: 0 10px" :disabled="isRootPath">删除</el-button>
+                        </el-popconfirm>
+                        <el-button type="primary" :loading="loading" :disabled="!curr.path" @click="handleDownload">文件下载</el-button>
+                        <el-upload
+                          class="file-upload"
+                          action="uploadFiles"
+                          :headers="{...headers, Path: encodeUnicode(curr.path)}"
+                          :on-success="handleRefresh"
+                          name="file"
+                          multiple
+                        >
+                            <el-button style="margin: 0 10px" type="warning">文件上传</el-button>
+                        </el-upload>
+                    </div>
+                </div>
+            </el-card>
+            <el-card class="shell-box">
+                <div ref="terminal" class="terminal"></div>
+            </el-card>
+        </el-col>
+    </el-row>
+</div>
+
+<!-- 引入 Vue.js CDN -->
+<script src="{{ prefix }}{% static 'js/vue-2.6.14.js' %}"></script>
+<script src="{{ prefix }}{% static 'js/axios.min.js' %}"></script>
+<script src="{{ prefix }}{% static 'js/element-ui.js' %}"></script>
+<script src="{{ prefix }}{% static 'js/xterm.js' %}"></script>
+<script src="{{ prefix }}{% static 'js/xterm-addon-fit.js' %}"></script>
+<script src="{{ prefix }}{% static 'js/socket.io.min.js' %}"></script>
+
+<script>
+    // 初始化 Vue 实例
+    new Vue({
+        el: '#app',
+        delimiters: ['${', '}'], // 自定义分隔符
+        data() {
+            return {
+                props: {
+                    label: 'name',
+                    children: 'zones'
+                },
+                headers: {
+                    'X-CSRFToken': '{{ csrf_token }}',
+                },
+                curr: {
+                    path: '{{rootPath|safe}}'
+                },
+                loading: false,
+                send_to_terminal: '',
+                systemInfo: {
+                    connected: true,
+                    cpuUsage: '0%',
+                    memoryUsage: '0%',
+                },
+                socket: null,
+                term: null,
+                fit: null,
+                observer: null,
+            }
+        },
+        computed: {
+            isRootPath() {
+                return this.curr.path === '{{rootPath|safe}}'
+            },
+        },
+        mounted() {
+            this.initSocket()
+            this.initTerm()
+            this.observeHeight();
+        },
+        beforeDestroy() {
+            this.observer?.disconnect();
+        },
+        methods: {
+            initSocket() {
+                // 获取或生成唯一 client_id
+                const clientId = localStorage.getItem("clientId") || this.generateUUID();
+                localStorage.setItem("clientId", clientId);
+
+                const socket = io.connect({
+                    path:  '{{ prefix }}/socket.io',
+                    transports: ["websocket", "polling"],
+                    query: { clientId }
+                });
+
+                socket.on('connect', () => {
+                    console.log('Connected to server');
+                    this.systemInfo.connected = true
+                });
+
+                socket.on('message', data => {
+                    this.term.write(data.output)
+                    this.systemInfo.connected = true
+                });
+
+                // 监听断开事件
+                socket.on('disconnect', () => {
+                    console.log('Disconnected. Attempting to reconnect...');
+                    this.systemInfo.connected = false;
+
+                    // 自动重连，Socket.IO 内部会自动尝试
+                });
+
+                this.socket = socket
+            },
+            initTerm() {
+                let _this = this
+                const term = new Terminal({
+                    rendererType: "canvas", //渲染类型
+                    convertEol: true, //启用时，光标将设置为下一行的开头
+                    // scrollback: 50, //终端中的回滚量
+                    disableStdin: false, // 启用交互
+                    // allowProposedApi: true, // 允许实验性 API，必要时开启
+                    cursorBlink: true, //光标闪烁
+                    // 允许 xterm 处理剪切板交互
+                    enableClipboard: true,
+                    theme: {
+                        foreground: "#ECECEC", //字体
+                        background: "#000000", //背景色
+                        cursor: "help", //设置光标
+                        lineHeight: 20
+                    }
+                });
+                term.open(this.$refs.terminal);
+
+                // 捕获快捷键事件
+                term.attachCustomKeyEventHandler((event) => {
+                    const { ctrlKey, key, type } = event;
+
+                    // Ctrl + C
+                    if (ctrlKey && key === 'c') {
+                        if (type === 'keydown') {
+                            const selectedText = term.getSelection();
+                            if (selectedText) {
+                                navigator.clipboard.writeText(selectedText);
+                                return false;
+                            }
+                        }
+                    }
+
+                    // Ctrl + V
+                    if (ctrlKey && key === 'v') {
+                        if (type === 'keydown') {
+                            navigator.clipboard.readText().then((text) => {
+                                this.socket.emit("send_message", {"input": ""})
+                            });
+                            return false;
+                        }
+                    }
+
+                    // Ctrl + R
+                    if (ctrlKey && key === 'r') {
+                        if (type === 'keydown') {
+                            this.socket.send('\x12');
+                        }
+                        return false;
+                    }
+
+                    return true;
+                });
+
+
+                term.write(
+                  ',--.   ,--. ,--.  ,--. ,--.   ,--. ,--. ,--. \r\n' +
+                  ' \\  `.\'  /  |  \'--\'  |  \\  `.\'  /  |  .\'   / \r\n' +
+                  '  .\'    \\   |  .--.  |   .\'    \\   |  .   \'  \r\n' +
+                  ' /  .\'.  \\  |  |  |  |  /  .\'.  \\  |  |\\   \\ \r\n' +
+                  '\'--\'   \'--\' `--\'  `--\' \'--\'   \'--\' `--\' \'--\' \r\n\n');
+
+                //黑窗口适应实际div宽高
+                const fit = new FitAddon.FitAddon();
+
+                term.loadAddon(fit)
+                fit.fit()
+                this.socket.emit("resize", {"cols": term.cols, "rows": term.rows})
+
+                term.onData(data => {
+                    this.socket.emit("send_message", {"input": data})
+                });
+                this.term = term
+                this.fit = fit
+            },
+            observeHeight() {
+                this.observer = new ResizeObserver(entries => {
+                    for (let entry of entries) {
+                        this.height = entry.contentRect.height;
+                        console.log('高度变化:', this.height);
+                        this.fit.fit()
+                        this.socket.emit("resize", {"cols": this.term.cols, "rows": this.term.rows})
+                    }
+                });
+
+                if (this.$refs.terminal) {
+                    this.observer.observe(this.$refs.terminal);
+                }
+            },
+            handleNodeClick(data, node) {
+                this.curr = data
+            },
+            async loadNode(node, resolve) {
+                if (node.level > 0 && ( !node.hasOwnProperty('level') || node.data.isParent !== 'true')) return resolve([])
+                const {data} = await axios.post('getDirContent', {path: node.level === 0 ? null : node.data.path})
+                return resolve(data)
+            },
+            generateUUID() {
+                return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                    const r = (Math.random() * 16) | 0;
+                    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+                    return v.toString(16);
+                });
+            },
+            encodeUnicode(str) {
+                if (!str) {
+                    str = 'None'
+                }
+                let res = [];
+                for (let i = 0; i < str.length; i++) {
+                    res[i] = ("00" + str.charCodeAt(i).toString(16)).slice(-4);
+                }
+                return "\\u" + res.join("\\u");
+            },
+            handleClear() {
+              this.curr = {
+                  path: '{{rootPath|safe}}'
+              }
+            },
+            handleRefresh() {
+                if (!this.isRootPath) {
+                    let currNode = this.$refs.tree.currentNode
+                    if (this.curr.isParent) {
+                        //  设置未进行懒加载状态
+                        currNode.node.loaded = false;
+                        // 重新展开节点就会间接重新触发load达到刷新效果
+                        currNode.node.expand();
+                        return
+                    } else if (currNode && currNode.$parent.node) {
+                        currNode.$parent.node.loaded = false
+                        currNode.$parent.node.expand()
+                        return
+                    }
+                }
+
+                this.$refs.tree.$data.root.loaded = false;
+                this.$refs.tree.$data.root.expand();
+            },
+            handleDelete() {
+                if (!this.isRootPath) {
+                    axios.post('deleteFile', {
+                      deletePath: this.curr.path
+                    }, {
+                      // 配置对象，设置请求头
+                      headers: {
+                          ...this.headers,
+                          'Content-Type': 'application/json'
+                      }
+                    })
+                    .then(res => {
+                        let currNode = this.$refs.tree.currentNode
+
+                        this.handleClear()
+                        if (currNode.$parent.node) {
+                            currNode.$parent.node.loaded = false
+                            currNode.$parent.node.expand()
+                            return
+                        }
+
+                        this.$refs.tree.$data.root.loaded = false;
+                        this.$refs.tree.$data.root.expand();
+                    })
+                }
+            },
+            handleDownload() {
+                if (!this.isRootPath) {
+                    let filename = this.curr.path.split('/').pop()
+                    if (this.curr.isParent) {
+                        filename += '.zip'
+                    }
+                    this.loading = true
+                    axios.post(`downloadFile`, {
+                        downloadPath: this.curr.path
+                    }, {
+                        responseType: 'blob',
+                        // 配置对象，设置请求头
+                        headers: {
+                            ...this.headers,
+                            'Content-Type': 'application/json'
+                        }
+                    }).then(res => {
+                        // 创建一个 URL 对象
+                        const url = window.URL.createObjectURL(new Blob([res.data]));
+
+                        // 创建一个链接元素并设置其属性
+                        const link = document.createElement('a');
+                        link.href = url;
+                        link.setAttribute('download', filename); // 如果需要，你可以手动设置文件名，或者用服务器返回的文件名
+
+                        // 模拟点击链接以下载文件
+                        document.body.appendChild(link);
+                        link.click();
+
+                        // 清理
+                        link.remove();
+                        window.URL.revokeObjectURL(url);
+                    }).finally(() => this.loading = false)
+                }
+            },
+            handleCommandSend(val) {
+                axios.post(`command`, {
+                    path: this.curr.path || 'rootPath',
+                    command: val,
+                }, {
+                    // 配置对象，设置请求头
+                    headers: {
+                        ...this.headers,
+                        'Content-Type': 'application/json'
+                    }
+                }).then(res => {
+                    if (res.statusText === 'OK') {
+                        this.send_to_terminal =
+                          res.data.returncode ?
+                            res.data.stderr :
+                            res.data.stdout
+
+                        this.handleRefresh()
+                    }
+                })
+            }
+        }
+    });
+</script>
+<style lang="scss">
+.tree-box {
+    .el-card__body {
+        .file-tree {
+            height: calc(100vh - 60px);
+            overflow: scroll;
+            scrollbar-width: none; /* 针对 Firefox */
+            -ms-overflow-style: none; /* 针对 Internet Explorer 和 Edge */
+
+            &::-webkit-scrollbar {
+                display: none;
+            }
+
+            .custom-tree-node {
+                position: relative;
+                width: 100%;
+
+                .name {
+                    white-space: nowrap; /* 禁止换行 */
+                    overflow: hidden; /* 隐藏超出容器的内容 */
+                    text-overflow: ellipsis; /* 用省略号表示溢出的文本 */
+                    width: 50%;
+                }
+
+                .info {
+                    position: absolute;
+                    right: 0;
+                    bottom: 0;
+                    font-size: 12px;
+
+                    display: flex;
+                    flex-wrap: nowrap;
+                    align-items: center;
+                    justify-content: space-between;
+                    width: 45%;
+
+                    .size {
+                        white-space: nowrap; /* 禁止换行 */
+                        overflow: hidden; /* 隐藏超出容器的内容 */
+                        text-overflow: ellipsis; /* 用省略号表示溢出的文本 */
+                        width: 30%;
+                    }
+                }
+            }
+
+            & > .el-tree-node {
+                padding-left: 0 !important;
+            }
+
+            .el-tree-node {
+                position: relative;
+                padding-left: 16px;
+            }
+
+            .el-tree-node__children {
+                padding-left: 16px;
+            }
+
+            .el-icon-caret-right:before {
+                display: none;
+            }
+
+            .el-tree-node__content {
+                padding: 0 10px 0 0 !important;
+            }
+
+            /* 竖线*/
+
+            .el-tree-node::before {
+                content: "";
+                height: 100%;
+                width: 1px;
+                position: absolute;
+                left: 2px;
+                top: -26px;
+                border-width: 1px;
+                border-left: 1px dashed #52627C;
+            }
+
+            /*当前层最后一个节点的竖线高度固定*/
+
+            .el-tree-node:last-child::before {
+                height: 38px; /*可以自己调节到合适数值*/
+            }
+
+            /*横线*/
+
+            .el-tree-node::after {
+                content: "";
+                width: 24px;
+                height: 20px;
+                position: absolute;
+                left: 2px;
+                top: 12px;
+                border-width: 1px;
+                border-top: 1px dashed #52627C;
+            }
+
+            .fa-hide {
+                display: none;
+            }
+
+            /*去掉最顶层的虚线，放最下面样式才不会被上面的覆盖了*/
+
+            & > .el-tree-node::after {
+                border-top: none;
+            }
+
+            & > .el-tree-node::before {
+                border-left: none;
+            }
+
+            /*展开关闭的icon*/
+
+            .el-tree-node__expand-icon {
+                font-size: 16px;
+                /*叶子节点（无子节点）*/
+
+                &.is-leaf {
+                    color: transparent;
+                    /*display: none; // 也可以去掉*/
+                }
+            }
+        }
+    }
+}
+
+.btns {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+
+    .left {
+        display: flex;
+        justify-content: start;
+        align-items: center;
+        gap: 15px;
+
+        &>i {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+        }
+    }
+
+    .right {
+        margin-top: 10px;
+        display: flex;
+        justify-content: end;
+        gap: 5px;
+
+        .file-upload {
+            position: relative;
+
+            .el-upload-list {
+                position: fixed;
+                right: 9px;
+                top: 130px;
+                z-index: 99;
+                background: #fff;
+                border-radius: 5px;
+                box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.72), 0 0 3px 0 rgba(0, 0, 0, 0.54);
+
+                .el-upload-list__item {
+                    padding: 5px 10px;
+
+
+                    .el-icon-close {
+                        top: 10px;
+                    }
+
+                    .el-upload-list__item-status-label {
+                        top: 5px;
+                    }
+                }
+            }
+        }
+    }
+}
+
+.options-box {
+    height: 120px;
+    overflow: hidden;
+}
+
+.shell-box {
+    margin-top: 5px;
+
+    .el-card__body {
+        padding: 0;
+
+        .terminal {
+            height: calc(100vh - 163px);
+            width: 100%;
+            padding: 5px;
+            background: black;
+
+            .xterm-viewport {
+                width: 100% !important;
+
+                scrollbar-width: none; /* 针对 Firefox */
+                -ms-overflow-style: none; /* 针对 Internet Explorer 和 Edge */
+
+                &::-webkit-scrollbar {
+                    display: none;
+                }
+            }
+        }
+    }
+}
+</style>
+</body>
+</html>
