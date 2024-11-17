@@ -6,14 +6,11 @@ After=network.target
 # 工作目录（可选）
 WorkingDirectory=/opt/file-browser
 
-# 启动前先杀掉可能存在的旧进程
-ExecStartPre=/bin/bash -c 'pkill -f "file-browser runserver" || true'
-
 # 启动命令
 ExecStart=/opt/file-browser/./file-browser runserver --noreload
-
-# 停止时杀掉进程
-ExecStop=/bin/bash -c 'pkill -f "file-browser runserver"'
+PIDFile=/opt/file-browser/file-browser.pid
+ExecStartPre=/bin/bash -c 'if [ -f /opt/file-browser/file-browser.pid ]; then kill -9 $(cat /opt/file-browser/file-browser.pid) || true; fi; rm -f /opt/file-browser/file-browser.pid'
+ExecStop=/bin/bash -c 'if [ -f /opt/file-browser/file-browser.pid ]; then kill -9 $(cat /opt/file-browser/file-browser.pid) || true; fi'
 
 # 用户和组（可选，根据需要设置）
 User=root
@@ -24,7 +21,7 @@ Environment="PATH=/usr/local/bin:/usr/bin:/bin"
 
 # 进程守护
 Restart=always
-RestartSec=5s
+RestartSec=3s
 
 [Install]
 WantedBy=multi-user.target
