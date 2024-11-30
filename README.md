@@ -28,8 +28,4 @@ systemctl enable file-browser.service
 ```
 
 ## 界面展示
-
-
-## 待完成
-### 1. 客户端奔溃问题
-### 2. 客户断连清除缓存
+![file-browser.png](file-browser.png)
